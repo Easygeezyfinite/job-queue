@@ -12,7 +12,7 @@ what a production queue would need on top of that, rather than build all of it.
 
 - [x] Job model and `submit` (LPUSH)
 - [x] Worker loop (BRPOP) and FIFO tests
-- [ ] Future work write-up
+- [x] Future work write-up (see [Future work](#future-work))
 
 ## How it works
 
@@ -136,3 +136,73 @@ docker exec redis redis-cli ping
 ```
 
 If the `redis` container already exists, start it with `docker start redis` instead.
+
+## Future work
+
+The project stops here on purpose. These are the pieces a production queue would add,
+roughly in the order I'd build them, and how each one would fit the current design.
+
+### 1. At-least-once delivery
+
+Fixes the limitation above. Instead of `BRPOP`, a worker would use
+`BLMOVE jobqueue:<name> jobqueue:<name>:processing:<worker id> RIGHT LEFT`, which takes
+the job and parks it on a per-worker list in one atomic step. The worker deletes it
+from that list (`LREM`) only after the handler finishes. If the worker dies, the job is
+still sitting in its processing list and can be recovered.
+
+The trade-off is that a job can now run twice (the worker finishes the handler but
+crashes before the `LREM`), so handlers need to be idempotent. Sending the same email
+twice is a real bug, so a handler would record "job X done" somewhere before or along
+with its side effect.
+
+### 2. Retries with backoff
+
+Right now a failing job goes straight to the failed list. A `Job` would get an
+`attempts` count and a `max_attempts` limit. On failure the worker bumps the count and,
+if there are attempts left, re-queues the job with a delay that doubles each time
+(for example 1s, 2s, 4s, 8s, plus a little random jitter so many failed jobs don't all
+retry in the same instant). Only after the last attempt does it land on the failed
+list. Delayed re-queueing depends on scheduling (next item).
+
+### 3. Scheduled and delayed jobs
+
+A Redis sorted set, `jobqueue:<name>:scheduled`, with the run time as the score. A
+small loop (or each worker between jobs) runs `ZRANGEBYSCORE ... -inf <now>` to find
+jobs that are due and moves them onto the main list. Moving them has to be atomic
+(a Lua script or `MULTI`) so two workers can't both move the same job and run it
+twice. Retries from item 2 would use the same sorted set.
+
+### 4. Multi-worker coordination
+
+`BRPOP` already makes sure two workers never get the same job, and the tests check
+that with three workers. What's missing is the cleanup side of item 1:
+
+- Each worker writes a heartbeat key with a short TTL (`SET worker:<id> alive EX 30`)
+  every few seconds.
+- A "reaper" checks the processing lists. If a worker's heartbeat has expired, its
+  in-flight jobs go back on the main queue.
+- Graceful shutdown: on SIGTERM, finish the current job, then exit, instead of only
+  checking `stop()` between jobs.
+
+### 5. Monitoring
+
+The numbers I'd want on a dashboard, most of them one Redis command away:
+
+| Metric | Where it comes from |
+|---|---|
+| Queue depth | `LLEN jobqueue:<name>` |
+| Failed jobs | `LLEN jobqueue:<name>:failed` |
+| Jobs in flight | `LLEN` of each processing list |
+| Live workers | count of unexpired heartbeat keys |
+| Job latency (submit to start) | `created_at` vs. the time the worker picks it up |
+| Handler duration and error rate | timed and counted in the worker loop |
+
+These would be exposed as Prometheus metrics or a small `/stats` endpoint, with an
+alert when queue depth keeps growing (workers can't keep up) or the failed list grows
+quickly. A small CLI to list failed jobs and re-queue them by id would also help.
+
+### Not planned
+
+- Job priorities (would need one list per priority, or a sorted set instead of a list).
+- Exactly-once processing. Across a network that means idempotent handlers plus
+  at-least-once delivery (item 1), not a stronger queue.
