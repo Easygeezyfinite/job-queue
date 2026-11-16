@@ -111,6 +111,7 @@ tests/
     test_job.py
     test_queue_submit.py
     test_worker.py
+.github/workflows/ci.yml   runs the tests against real Redis on every push
 ```
 
 ## Running the tests
@@ -136,6 +137,9 @@ docker exec redis redis-cli ping
 ```
 
 If the `redis` container already exists, start it with `docker start redis` instead.
+
+On GitHub, `.github/workflows/ci.yml` runs the suite on every push against a real
+Redis 7 service container, and fails the build if any test is skipped.
 
 ## Future work
 
